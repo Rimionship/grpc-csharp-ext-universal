@@ -143,6 +143,10 @@ jobs:
             echo "::error::non-system dependencies: $bad"
             exit 1
           fi
+          # The linker ad-hoc signs only the arm64 slice. Apple Silicon refuses to
+          # map unsigned code, and a fat file verifies only if every slice is
+          # signed: ad-hoc sign the whole universal file (no identity, no team).
+          codesign --force --sign - "$f"
           codesign --verify --verbose=2 "$f"
           codesign -dv "$f" 2>&1 || true
 
