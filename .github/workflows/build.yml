@@ -65,7 +65,13 @@ jobs:
       - name: Configure
         run: |
           set -euo pipefail
+          # -Dfdopen=fdopen: the bundled zlib 1.2.11 (third_party/zlib/zutil.h)
+          # does `#define fdopen(fd,mode) NULL` on macOS unless fdopen is
+          # already a macro, which breaks against current macOS SDK headers.
+          # zlib >= 1.2.12 dropped that block; predefining the name is the
+          # usual workaround and changes no code.
           cmake -S grpc -B build \
+            -DCMAKE_C_FLAGS="-Dfdopen=fdopen" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deployment_target }} \
