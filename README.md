@@ -33,10 +33,13 @@ Actions (actions pinned to commit SHAs):
    CMake, `Release`, `-DgRPC_BUILD_CSHARP_EXT=ON`, target `grpc_csharp_ext`,
    same flags as upstream's `tools/run_tests/artifacts/build_artifact_csharp.sh`
    (`gRPC_BACKWARDS_COMPATIBILITY_MODE=ON`, `gRPC_XDS_USER_AGENT_IS_CSHARP=ON`).
-2. Deployment target: **arm64 11.0** (the first macOS on Apple Silicon, so no
-   real restriction) and **x86_64 10.13** (the oldest target current Xcode
-   accepts; Intel Macs on 10.13–10.15 keep working, as they did with the NuGet
-   build, which targeted 10.10).
+2. Deployment target: the workflow passes **arm64 11.0** (the first macOS on
+   Apple Silicon, so no real restriction) and **x86_64 10.13** (the oldest target
+   current Xcode accepts). Note: `gRPC_BACKWARDS_COMPATIBILITY_MODE=ON` makes gRPC's
+   own `CMakeLists.txt` set `CMAKE_OSX_DEPLOYMENT_TARGET 10.10` on macOS (exactly as
+   in the NuGet build), so the x86_64 slice records `LC_VERSION_MIN_MACOSX 10.10`;
+   the arm64 slice records `minos 11.0` (clang's floor for arm64). Treat
+   **macOS 10.13** (Intel) / **11.0** (Apple Silicon) as the supported minimum.
 3. `lipo -create` to `libgrpc_csharp_ext.dylib`; the log shows `lipo -info` and
    `otool -L`, and the job fails if anything other than system libraries
    (`/usr/lib/…`, `/System/Library/…`) is linked.

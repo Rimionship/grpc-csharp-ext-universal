@@ -30,8 +30,10 @@ jobs:
             deployment_target: "11.0"
           - arch: x86_64
             runner: macos-15-intel
-            # Oldest target the current Xcode accepts; keeps Intel Macs on
-            # 10.13-10.15 working (the NuGet build used 10.10).
+            # Oldest target the current Xcode accepts. NB: grpc's CMakeLists
+            # forces 10.10 for its own targets when
+            # gRPC_BACKWARDS_COMPATIBILITY_MODE=ON (as in the NuGet build), so
+            # the slice records LC_VERSION_MIN_MACOSX 10.10.
             deployment_target: "10.13"
     runs-on: ${{ matrix.runner }}
     steps:
