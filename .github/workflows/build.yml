@@ -1,0 +1,245 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  # Official gRPC source. Grpc.Core 2.46.6 (NuGet) was built from grpc/grpc
+  # commit cdc97245 (see <repository commit=...> in grpc.core.nuspec); the tag
+  # v1.46.6 is its direct child and only touches tools/internal_ci/ scripts.
+  GRPC_REPO: grpc/grpc
+  GRPC_TAG: v1.46.6
+  GRPC_TAG_COMMIT: 18dda3c586b2607d8daead6b97922e59d867bb7d
+  EXPECTED_VERSION: "24.0.0" # grpc_version_string() of gRPC core 1.46.x
+
+jobs:
+  slice:
+    name: build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            # Apple Silicon is supported from macOS 11.0 on; lower is impossible.
+            deployment_target: "11.0"
+          - arch: x86_64
+            runner: macos-15-intel
+            # Oldest target the current Xcode accepts; keeps Intel Macs on
+            # 10.13-10.15 working (the NuGet build used 10.10).
+            deployment_target: "10.13"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check runner architecture
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          sw_vers
+          xcodebuild -version
+          cmake --version
+
+      - name: Checkout grpc ${{ env.GRPC_TAG }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GRPC_REPO }}
+          ref: refs/tags/${{ env.GRPC_TAG }}
+          path: grpc
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify source commit
+        working-directory: grpc
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          echo "grpc HEAD: $head"
+          test "$head" = "$GRPC_TAG_COMMIT"
+          git submodule status --recursive
+          grep -n 'gRPC_CSHARP_VERSION ' CMakeLists.txt
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S grpc -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deployment_target }} \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DgRPC_BUILD_CSHARP_EXT=ON \
+            -DgRPC_BUILD_TESTS=OFF \
+            -DgRPC_BACKWARDS_COMPATIBILITY_MODE=ON \
+            -DgRPC_XDS_USER_AGENT_IS_CSHARP=ON
+
+      - name: Build grpc_csharp_ext
+        run: cmake --build build --target grpc_csharp_ext --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Inspect slice
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # CMake emits a versioned file plus symlinks; take the real file.
+          cp -L build/libgrpc_csharp_ext.dylib out/libgrpc_csharp_ext.${{ matrix.arch }}.dylib
+          f=out/libgrpc_csharp_ext.${{ matrix.arch }}.dylib
+          lipo -info "$f"
+          otool -L "$f"
+          otool -l "$f" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+          nm -gU "$f" | grep -c ' _grpcsharp_'
+          shasum -a 256 "$f"
+
+      - name: Upload slice
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slice-${{ matrix.arch }}
+          path: out/libgrpc_csharp_ext.${{ matrix.arch }}.dylib
+          if-no-files-found: error
+
+  universal:
+    needs: slice
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download slices
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: slice-*
+          merge-multiple: true
+          path: slices
+
+      - name: Create universal dylib
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          lipo -create \
+            slices/libgrpc_csharp_ext.x86_64.dylib \
+            slices/libgrpc_csharp_ext.arm64.dylib \
+            -output dist/libgrpc_csharp_ext.dylib
+          f=dist/libgrpc_csharp_ext.dylib
+          echo "::group::lipo -info"
+          lipo -info "$f"
+          echo "::endgroup::"
+          lipo "$f" -verify_arch x86_64 arm64
+          echo "::group::otool -L (all archs)"
+          otool -arch all -L "$f"
+          echo "::endgroup::"
+          # Only system libraries are allowed as dependencies.
+          bad="$(otool -arch all -L "$f" | grep -E '^\s' | awk '{print $1}' \
+                 | grep -vE '^(/usr/lib/|/System/Library/)' \
+                 | grep -v 'libgrpc_csharp_ext' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::non-system dependencies: $bad"
+            exit 1
+          fi
+          codesign --verify --verbose=2 "$f"
+          codesign -dv "$f" 2>&1 || true
+
+      - name: Smoke test (load natively on arm64)
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import ctypes, os, platform
+          lib = ctypes.CDLL(os.path.abspath("dist/libgrpc_csharp_ext.dylib"))
+          lib.grpcsharp_version_string.restype = ctypes.c_char_p
+          lib.grpcsharp_init()
+          v = lib.grpcsharp_version_string().decode()
+          lib.grpcsharp_shutdown()
+          print(platform.machine(), "grpc core", v)
+          assert platform.machine() == "arm64", platform.machine()
+          assert v == os.environ["EXPECTED_VERSION"], v
+          EOF
+
+      - name: Checksum
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shasum -a 256 libgrpc_csharp_ext.dylib | tee libgrpc_csharp_ext.dylib.sha256
+          echo "### SHA256" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat libgrpc_csharp_ext.dylib.sha256 >> "$GITHUB_STEP_SUMMARY"
+          lipo -info libgrpc_csharp_ext.dylib >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/libgrpc_csharp_ext.dylib
+
+      - name: Upload universal
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libgrpc_csharp_ext-universal
+          path: dist/
+          if-no-files-found: error
+
+  smoke-intel:
+    needs: universal
+    runs-on: macos-15-intel
+    steps:
+      - name: Download universal
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: libgrpc_csharp_ext-universal
+          path: dist
+
+      - name: Smoke test (load natively on x86_64)
+        run: |
+          set -euo pipefail
+          cd dist && shasum -a 256 -c libgrpc_csharp_ext.dylib.sha256 && cd ..
+          python3 - <<'EOF'
+          import ctypes, os, platform
+          lib = ctypes.CDLL(os.path.abspath("dist/libgrpc_csharp_ext.dylib"))
+          lib.grpcsharp_version_string.restype = ctypes.c_char_p
+          lib.grpcsharp_init()
+          v = lib.grpcsharp_version_string().decode()
+          lib.grpcsharp_shutdown()
+          print(platform.machine(), "grpc core", v)
+          assert platform.machine() == "x86_64", platform.machine()
+          assert v == os.environ["EXPECTED_VERSION"], v
+          EOF
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [universal, smoke-intel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download universal
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: libgrpc_csharp_ext-universal
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c libgrpc_csharp_ext.dylib.sha256
+          {
+            echo "Universal (x86_64 + arm64) \`libgrpc_csharp_ext.dylib\` built from the official"
+            echo "[\`$GRPC_REPO\` \`$GRPC_TAG\`](https://github.com/$GRPC_REPO/tree/$GRPC_TAG_COMMIT) source"
+            echo "(commit \`$GRPC_TAG_COMMIT\`), matching NuGet \`Grpc.Core\` 2.46.6."
+            echo
+            echo '```'
+            cat libgrpc_csharp_ext.dylib.sha256
+            echo '```'
+            echo
+            echo "Verify: \`gh attestation verify libgrpc_csharp_ext.dylib --repo $GITHUB_REPOSITORY\`"
+            echo
+            echo "Build run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > notes.md
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            libgrpc_csharp_ext.dylib libgrpc_csharp_ext.dylib.sha256
